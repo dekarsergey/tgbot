@@ -1,6 +1,7 @@
 import aiosqlite
 import csv
 import io
+import json
 from datetime import datetime
 
 
@@ -39,13 +40,26 @@ class Database:
                 failed      INTEGER DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS funnel_steps (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                position     INTEGER NOT NULL,
+                text         TEXT,
+                media_type   TEXT,
+                media_id     TEXT,
+                buttons      TEXT DEFAULT '[]',
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
         """)
-        # Добавляем колонку funnel_step если её нет (миграция для старых баз)
-        try:
-            await self._conn.execute("ALTER TABLE users ADD COLUMN funnel_step INTEGER DEFAULT 0")
-            await self._conn.commit()
-        except Exception:
-            pass
+        # Миграции для старых баз
+        for col, definition in [
+            ("funnel_step", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                await self._conn.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         await self._conn.commit()
 
     async def close(self):
@@ -106,10 +120,100 @@ class Database:
         )
         await self._conn.commit()
 
+    # ─── Funnel Steps ─────────────────────────────────────────────────────────
+
+    async def get_funnel_steps(self) -> list:
+        async with self._conn.execute(
+            "SELECT * FROM funnel_steps ORDER BY position ASC"
+        ) as cur:
+            return await cur.fetchall()
+
+    async def get_funnel_step(self, step_id: int):
+        async with self._conn.execute(
+            "SELECT * FROM funnel_steps WHERE id = ?", (step_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+    async def get_funnel_step_by_position(self, position: int):
+        async with self._conn.execute(
+            "SELECT * FROM funnel_steps WHERE position = ?", (position,)
+        ) as cur:
+            return await cur.fetchone()
+
+    async def count_funnel_steps(self) -> int:
+        async with self._conn.execute("SELECT COUNT(*) FROM funnel_steps") as cur:
+            row = await cur.fetchone()
+            return row[0]
+
+    async def add_funnel_step(self, text: str, media_type: str, media_id: str,
+                               buttons: list) -> int:
+        now = datetime.utcnow().isoformat()
+        # Получаем следующую позицию
+        async with self._conn.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM funnel_steps"
+        ) as cur:
+            row = await cur.fetchone()
+            position = row[0]
+        cursor = await self._conn.execute(
+            """INSERT INTO funnel_steps (position, text, media_type, media_id, buttons, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (position, text, media_type, media_id, json.dumps(buttons, ensure_ascii=False), now, now)
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def update_funnel_step(self, step_id: int, text: str, media_type: str,
+                                  media_id: str, buttons: list):
+        now = datetime.utcnow().isoformat()
+        await self._conn.execute(
+            """UPDATE funnel_steps SET text=?, media_type=?, media_id=?, buttons=?, updated_at=?
+               WHERE id=?""",
+            (text, media_type, media_id, json.dumps(buttons, ensure_ascii=False), now, step_id)
+        )
+        await self._conn.commit()
+
+    async def delete_funnel_step(self, step_id: int):
+        # Получаем позицию удаляемого
+        step = await self.get_funnel_step(step_id)
+        if not step:
+            return
+        pos = step["position"]
+        await self._conn.execute("DELETE FROM funnel_steps WHERE id = ?", (step_id,))
+        # Сдвигаем позиции оставшихся
+        await self._conn.execute(
+            "UPDATE funnel_steps SET position = position - 1 WHERE position > ?", (pos,)
+        )
+        await self._conn.commit()
+
+    async def move_funnel_step(self, step_id: int, direction: str):
+        """direction: 'up' | 'down'"""
+        step = await self.get_funnel_step(step_id)
+        if not step:
+            return
+        pos = step["position"]
+        target_pos = pos - 1 if direction == "up" else pos + 1
+        # Находим соседа
+        async with self._conn.execute(
+            "SELECT id FROM funnel_steps WHERE position = ?", (target_pos,)
+        ) as cur:
+            neighbor = await cur.fetchone()
+        if not neighbor:
+            return
+        # Меняем местами
+        await self._conn.execute(
+            "UPDATE funnel_steps SET position = ? WHERE id = ?", (target_pos, step_id)
+        )
+        await self._conn.execute(
+            "UPDATE funnel_steps SET position = ? WHERE id = ?", (pos, neighbor["id"])
+        )
+        await self._conn.commit()
+
     # ─── Stats ───────────────────────────────────────────────────────────────
 
     async def get_stats(self) -> dict:
         stats = {}
+        # Динамически считаем шаги воронки
+        steps = await self.get_funnel_steps()
         queries = {
             "total_users":      "SELECT COUNT(*) FROM users",
             "subscribed":       "SELECT COUNT(*) FROM users WHERE subscribed = 1",
@@ -122,15 +226,19 @@ class Database:
             "active_month":     "SELECT COUNT(DISTINCT user_id) FROM events WHERE created_at >= datetime('now', '-30 days')",
             "broadcasts_total": "SELECT COUNT(*) FROM broadcasts",
             "broadcasts_errors":"SELECT COALESCE(SUM(failed), 0) FROM broadcasts",
-            "funnel_step1":     "SELECT COUNT(*) FROM users WHERE funnel_step >= 1",
-            "funnel_step2":     "SELECT COUNT(*) FROM users WHERE funnel_step >= 2",
-            "funnel_step3":     "SELECT COUNT(*) FROM users WHERE funnel_step >= 3",
-            "funnel_step4":     "SELECT COUNT(*) FROM users WHERE funnel_step >= 4",
         }
         for key, query in queries.items():
             async with self._conn.execute(query) as cur:
                 row = await cur.fetchone()
                 stats[key] = row[0]
+        # Статистика по каждому шагу воронки
+        for i, step in enumerate(steps, 1):
+            async with self._conn.execute(
+                "SELECT COUNT(*) FROM users WHERE funnel_step >= ?", (i,)
+            ) as cur:
+                row = await cur.fetchone()
+                stats[f"funnel_step{i}"] = row[0]
+        stats["funnel_total_steps"] = len(steps)
         return stats
 
     async def get_recent_users(self, limit: int = 10) -> list:
