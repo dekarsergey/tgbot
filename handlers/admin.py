@@ -133,8 +133,9 @@ def kb_confirm_delete(step_id: int) -> InlineKeyboardMarkup:
 
 def kb_broadcast_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Предпросмотр",         callback_data="adm_bc_preview")],
+        [InlineKeyboardButton(text="🚀 Подтвердить отправку", callback_data="adm_bc_confirm")],
         [InlineKeyboardButton(text="➕ Добавить кнопку",      callback_data="adm_bc_add_btn")],
-        [InlineKeyboardButton(text="🚀 Запустить рассылку",   callback_data="adm_bc_confirm")],
         [InlineKeyboardButton(text="❌ Отмена",               callback_data="adm_menu")],
     ])
 
@@ -199,6 +200,7 @@ async def _admin_home_text(db: Database) -> str:
     return "\n".join(lines)
 
 
+@router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext, db: Database):
     await state.clear()
     await message.answer(await _admin_home_text(db), reply_markup=kb_main(), parse_mode="HTML")
@@ -674,12 +676,12 @@ async def cmd_mailing(message: Message, state: FSMContext):
 async def bc_got_content(message: Message, state: FSMContext):
     await state.update_data(bc_msg_id=message.message_id, bc_chat_id=message.chat.id)
     await state.set_state(BroadcastState.waiting_buttons)
-    data = await state.get_data()
-    step_key = "bc"
     await message.answer(
         "👆 Сообщение получено!\n\n"
-        "Добавить кнопки-ссылки?\n"
-        "<code>Текст | https://ссылка</code>",
+        "Добавить кнопки-ссылки? Каждую кнопку — отдельным сообщением:\n"
+        "<code>Текст | https://ссылка | green</code>\n\n"
+        "Цвета: <b>green</b> 🟢 · <b>blue</b> 🔵 · <b>red</b> 🔴 · без цвета — серый\n\n"
+        "Или сразу смотри предпросмотр 👇",
         reply_markup=kb_broadcast_confirm(),
         parse_mode="HTML"
     )
@@ -687,14 +689,18 @@ async def bc_got_content(message: Message, state: FSMContext):
 @router.callback_query(F.data == "adm_bc_add_btn", BroadcastState.waiting_buttons)
 async def bc_add_btn(callback: CallbackQuery):
     await callback.message.edit_text(
-        "Отправь кнопку:\n<code>Текст | https://ссылка</code>",
+        "Отправь кнопку отдельным сообщением:\n"
+        "<code>Текст | https://ссылка</code>\n"
+        "<code>Текст | https://ссылка | green</code>\n"
+        "<code>Текст | https://ссылка | blue</code>\n"
+        "<code>Текст | https://ссылка | red</code>",
         parse_mode="HTML"
     )
 
 @router.message(BroadcastState.waiting_buttons)
 async def bc_got_button(message: Message, state: FSMContext):
-    if "|" not in message.text:
-        await message.answer("❌ Формат: <code>Текст | https://ссылка</code>", parse_mode="HTML")
+    if not message.text or "|" not in message.text:
+        await message.answer("❌ Формат: <code>Текст | https://ссылка</code> или с цветом: <code>Текст | https://ссылка | green</code>", parse_mode="HTML")
         return
     parts = [p.strip() for p in message.text.split("|")]
     btn_text = parts[0]
@@ -707,14 +713,79 @@ async def bc_got_button(message: Message, state: FSMContext):
     buttons = data.get("buttons", [])
     buttons.append({"text": btn_text, "url": url, "color": color})
     await state.update_data(buttons=buttons)
-    color_str = f" 🎨 {color}" if color else ""
+    color_icons = {"green": "🟢", "blue": "🔵", "red": "🔴"}
+    color_str = f" {color_icons.get(color, '')} {color}" if color else ""
+    btn_list = "\n".join([f"  • {b['text']} {color_icons.get(b.get('color',''),'')}" for b in buttons])
     await message.answer(
-        f"✅ Кнопка добавлена: <b>{btn_text}</b>{color_str}\nВсего: <b>{len(buttons)}</b>",
+        f"✅ Кнопка добавлена!\n\n<b>Все кнопки:</b>\n{btn_list}",
+        reply_markup=kb_broadcast_confirm(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "adm_bc_preview")
+async def bc_preview(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    data = await state.get_data()
+    msg_id = data.get("bc_msg_id")
+    from_chat = data.get("bc_chat_id")
+    buttons = data.get("buttons", [])
+    reply_markup = build_inline_kb(buttons)
+
+    if not msg_id:
+        await callback.answer("❌ Сначала отправь сообщение для рассылки", show_alert=True)
+        return
+
+    await callback.answer("Отправляю предпросмотр...")
+    await callback.message.answer("👁 <b>Предпросмотр — так увидят пользователи:</b>", parse_mode="HTML")
+    await bot.copy_message(
+        chat_id=callback.from_user.id,
+        from_chat_id=from_chat,
+        message_id=msg_id,
+        reply_markup=reply_markup
+    )
+    await callback.message.answer(
+        "☝️ Всё верно? Запускай или вноси правки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="adm_bc_send")],
+            [InlineKeyboardButton(text="➕ Добавить кнопку",    callback_data="adm_bc_add_btn")],
+            [InlineKeyboardButton(text="🗑 Убрать все кнопки",  callback_data="adm_bc_clear_btns")],
+            [InlineKeyboardButton(text="❌ Отмена",             callback_data="adm_menu")],
+        ]),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "adm_bc_clear_btns")
+async def bc_clear_btns(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(buttons=[])
+    await callback.message.edit_text(
+        "🗑 Кнопки удалены.\n\nМожешь добавить новые или запустить рассылку.",
         reply_markup=kb_broadcast_confirm(),
         parse_mode="HTML"
     )
 
 @router.callback_query(F.data == "adm_bc_confirm")
+async def bc_show_confirm(callback: CallbackQuery, state: FSMContext):
+    """Показываем финальное подтверждение с кол-вом получателей."""
+    data = await state.get_data()
+    target = data.get("target", "all")
+    buttons = data.get("buttons", [])
+    btn_list = "\n".join([f"  • {b['text']}" for b in buttons]) if buttons else "  нет"
+    label = "всем пользователям" if target == "all" else "только подписчикам"
+    await callback.message.edit_text(
+        f"📣 <b>Готово к отправке</b>\n\n"
+        f"Получатели: <b>{label}</b>\n"
+        f"Кнопки:\n{btn_list}\n\n"
+        f"Нажми 👁 Предпросмотр чтобы проверить, или сразу запускай.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👁 Предпросмотр",        callback_data="adm_bc_preview")],
+            [InlineKeyboardButton(text="🚀 Запустить рассылку",  callback_data="adm_bc_send")],
+            [InlineKeyboardButton(text="➕ Добавить кнопку",     callback_data="adm_bc_add_btn")],
+            [InlineKeyboardButton(text="🗑 Убрать все кнопки",   callback_data="adm_bc_clear_btns")],
+            [InlineKeyboardButton(text="❌ Отмена",              callback_data="adm_menu")],
+        ]),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "adm_bc_send")
 async def bc_send(callback: CallbackQuery, bot: Bot, db: Database, state: FSMContext):
     data = await state.get_data()
     await state.clear()
@@ -732,7 +803,7 @@ async def bc_send(callback: CallbackQuery, bot: Bot, db: Database, state: FSMCon
     user_ids = await db.get_all_user_ids() if target == "all" else await db.get_subscribed_user_ids()
     total = len(user_ids)
     sent = failed = 0
-    status = await callback.message.edit_text(f"⏳ 0 / {total}")
+    status = await callback.message.answer(f"⏳ Запускаю... 0 / {total}")
 
     for i, uid in enumerate(user_ids):
         try:
@@ -750,6 +821,9 @@ async def bc_send(callback: CallbackQuery, bot: Bot, db: Database, state: FSMCon
 
     await db.log_broadcast(sent, failed)
     await status.edit_text(
-        f"✅ <b>Рассылка завершена!</b>\n📤 Отправлено: <b>{sent}</b>\n❌ Ошибок: <b>{failed}</b>",
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📤 Отправлено: <b>{sent}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>\n"
+        f"<i>(ошибки = бот заблокирован у пользователя)</i>",
         reply_markup=kb_back(), parse_mode="HTML"
     )
