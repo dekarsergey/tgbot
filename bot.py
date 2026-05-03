@@ -30,6 +30,7 @@ async def set_commands(bot: Bot, config: Config):
         BotCommand(command="stats",   description="Показать статистику"),
         BotCommand(command="users",   description="Последние пользователи"),
         BotCommand(command="sources", description="Источники переходов"),
+        BotCommand(command="funnel",   description="Редактор воронки сообщений"),
         BotCommand(command="export",  description="Выгрузить CSV"),
     ]
 
@@ -56,8 +57,8 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
 
     # Middleware
-    dp.message.middleware(LoggingMiddleware(db))
-    dp.callback_query.middleware(LoggingMiddleware(db))
+    dp.message.middleware(LoggingMiddleware())
+    dp.callback_query.middleware(LoggingMiddleware())
 
     # Routers
     dp.include_router(admin.router)
