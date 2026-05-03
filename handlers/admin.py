@@ -162,7 +162,6 @@ def build_inline_kb(buttons: list):
 
 # ─── /admin ──────────────────────────────────────────────────────────────────
 
-@router.message(Command("admin"))
 async def _admin_home_text(db: Database) -> str:
     s = await db.get_stats()
     total = s["total_users"] or 1
